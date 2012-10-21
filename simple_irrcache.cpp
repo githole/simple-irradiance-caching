@@ -602,7 +602,7 @@ Color radiance(const Ray &ray, const int depth, PhotonMap *photon_map, Irradianc
 				}
 			}
 
-			R0 = 1.0 / (R0 / (final_gather * final_gather));
+			R0 = 1.0 / (R0 / final_gather);
 
 			// イラディアンス追加
 			cache->AddPointToTree(Irradiance(hitpoint, accum * PI, orienting_normal, R0));
@@ -731,7 +731,7 @@ int main(int argc, char **argv) {
 	int photon_num = 50000;
 	double gather_photon_radius = 32.0;
 	int gahter_max_photon_num = 64;
-	int final_gather = 16; // final_gather x final_gather　個のサンプル
+	int final_gather = 64; // final_gather個のサンプル
 	int direct_light_samples = 64;
 
 	// カメラ位置
