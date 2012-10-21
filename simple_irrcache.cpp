@@ -224,9 +224,16 @@ struct Irradiance {
 	Color irradiance;
 	Vec normal;
 	double R0;
+	
+	Color translation_gradient[3];
+	Color rotational_gradient[3];
 
-	Irradiance(const Vec& position_, const Color& irradiance_, const Vec& normal_, const double R0_) :
+	Irradiance(const Vec& position_, const Color& irradiance_, const Vec& normal_, const double R0_, const Color translation_gradient_[3], const Color rotational_gradient_[3]) :
 	irradiance(irradiance_), position(position_), normal(normal_), R0(R0_) {
+		for (int i = 0; i < 3; i ++) {
+			translation_gradient[i] = translation_gradient_[i];
+			rotational_gradient[i] = rotational_gradient_[i];
+		}
 	}
 };
 
@@ -303,7 +310,7 @@ private:
 		}
 	}
 	
-	void add_new_point(KDTreeNode* node, const Irradiance& point) {
+	void search_tree(KDTreeNode* node, const Irradiance& point) {
 		const int axis = node->axis;
 		double delta;
 		switch (axis) {
@@ -314,7 +321,7 @@ private:
 
 		if (delta > 0.0) { // みぎ
 			if (node->right != NULL) {
-				add_new_point(node->right, point);
+				search_tree(node->right, point);
 			} else {
 				KDTreeNode* newnode = new KDTreeNode;
 				newnode->axis = (axis + 1) % 3;
@@ -324,7 +331,7 @@ private:
 			}
 		} else { // ひだり
 			if (node->left != NULL) {
-				add_new_point(node->left, point);
+				search_tree(node->left, point);
 			} else {
 				KDTreeNode* newnode = new KDTreeNode;
 				newnode->axis = (axis + 1) % 3;
@@ -344,7 +351,7 @@ public:
 	}
 	void AddPointToTree(const Irradiance &point) {
 		if (root != NULL) {
-			add_new_point(root, point);
+			search_tree(root, point);
 		} else {
 			KDTreeNode* newnode = new KDTreeNode;
 			newnode->axis = 0;
@@ -543,7 +550,7 @@ Color radiance(const Ray &ray, const int depth, PhotonMap *photon_map, Irradianc
 			// hitpointのイラディアンスを直接計算
 			// 計算方法は何でもいい。今回はフォトンマップを使う
 			double R0 = 0;
-
+			
 			// orienting_normalの方向を基準とした正規直交基底(w, u, v)を作る。この基底に対する半球内で次のレイを飛ばす。
 			Vec w, u, v;
 			w = orienting_normal;
@@ -554,58 +561,130 @@ Color radiance(const Ray &ray, const int depth, PhotonMap *photon_map, Irradianc
 			v = Cross(w, u);
 			
 			// ファイナルギャザリング
-			for (int fg = 0; fg < final_gather; fg ++) {
-				// コサイン項を使った重点的サンプリング
-				const double r1 = 2 * PI * rand01();
-				const double r2 = rand01(), r2s = sqrt(r2);
-				Vec dir = Normalize((u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1.0 - r2)));
-				Ray ray_(hitpoint, dir);
-				double t_; // レイからシーンの交差位置までの距離
-				int id_;   // 交差したシーン内オブジェクトのID
-				if (intersect_scene(ray_, &t_, &id_)) {
-					R0 += 1.0 / t_;
+			// 層化サンプリング（Irradiance Gradientsを求めるため）
 
-					const Sphere &obj_ = spheres[id_];
-					const Vec hitpoint_ = ray_.org + t_ * ray_.dir; // 交差位置
-					const Vec normal_  = Normalize(hitpoint_ - obj_.position); // 交差位置の法線
-					const Vec orienting_normal_ = Dot(normal_, ray_.dir) < 0.0 ? normal_ : (-1.0 * normal_); // 交差位置の法線（物体からのレイの入出を考慮）
+			std::vector<Color> L(final_gather * final_gather);
+			std::vector<double> dist(final_gather * final_gather);
+			std::vector<double> phi(final_gather);
+			std::vector<double> theta(final_gather);
 
-					// フォトンマップをつかって放射輝度推定する
-					PhotonMap::ResultQueue pqueue;
-					// k近傍探索。gather_radius半径内のフォトンを最大gather_max_photon_num個集めてくる
-					PhotonMap::Query query(hitpoint_, orienting_normal_, gather_radius, gahter_max_photon_num);
-					photon_map->SearchKNN(&pqueue, query);
-					Color accumulated_flux;
-					double max_distance2 = -1;
+			for (int i = 0; i < final_gather; i ++) {
+				phi[i] = 2 * PI * ((double)(i + rand01()) / final_gather);
+				const double r2 = ((double)(i + rand01()) / final_gather), r2s = sqrt(r2);
+				theta[i] = asin(r2s); 
+			}
 
-					// キューからフォトンを取り出しvectorに格納する
-					std::vector<PhotonMap::ElementForQueue> photons;
-					photons.reserve(pqueue.size());
-					for (;!pqueue.empty();) {
-						PhotonMap::ElementForQueue p = pqueue.top(); pqueue.pop();
-						photons.push_back(p);
-						max_distance2 = std::max(max_distance2, p.distance2);
-					}
+			for (int fi = 0; fi < final_gather; fi ++) {
+				for (int fj = 0; fj < final_gather; fj ++) {
+					// コサイン項を使った重点的サンプリング
+					const double r1 = phi[fi];
+					const double r2s = sin(theta[fj]);
+					const double r2 = r2s * r2s;
 
-					// 円錐フィルタを使用して放射輝度推定する
-					const double max_distance = sqrt(max_distance2);
-					const double k = 1.1;
-					for (int i = 0; i < photons.size(); i ++) {
-						const double weight = 1.0 - (sqrt(photons[i].distance2) / (k * max_distance)); // 円錐フィルタの重み
-						const Color value = Multiply(obj_.color, photons[i].point->power) / PI; // Diffuse面のBRDF = 1.0 / πであったのでこれをかける
-						accumulated_flux = accumulated_flux + weight * value;
-					}
-					accumulated_flux = accumulated_flux / (1.0 - 2.0 / (3.0 * k)); // 円錐フィルタの係数
-					if (max_distance2 > 0.0) {
-						accum = accum + accumulated_flux / (PI * max_distance2) / russian_roulette_probability / final_gather;
+					Vec dir = Normalize((u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1.0 - r2)));
+					Ray ray_(hitpoint, dir);
+					double t_; // レイからシーンの交差位置までの距離
+					int id_;   // 交差したシーン内オブジェクトのID
+					if (intersect_scene(ray_, &t_, &id_)) {
+						R0 += 1.0 / t_;
+
+						dist[fi * final_gather + fj] = t_;
+
+						const Sphere &obj_ = spheres[id_];
+						const Vec hitpoint_ = ray_.org + t_ * ray_.dir; // 交差位置
+						const Vec normal_  = Normalize(hitpoint_ - obj_.position); // 交差位置の法線
+						const Vec orienting_normal_ = Dot(normal_, ray_.dir) < 0.0 ? normal_ : (-1.0 * normal_); // 交差位置の法線（物体からのレイの入出を考慮）
+
+						// フォトンマップをつかって放射輝度推定する
+						PhotonMap::ResultQueue pqueue;
+						// k近傍探索。gather_radius半径内のフォトンを最大gather_max_photon_num個集めてくる
+						PhotonMap::Query query(hitpoint_, orienting_normal_, gather_radius, gahter_max_photon_num);
+						photon_map->SearchKNN(&pqueue, query);
+						Color accumulated_flux;
+						double max_distance2 = -1;
+
+						// キューからフォトンを取り出しvectorに格納する
+						std::vector<PhotonMap::ElementForQueue> photons;
+						photons.reserve(pqueue.size());
+						for (;!pqueue.empty();) {
+							PhotonMap::ElementForQueue p = pqueue.top(); pqueue.pop();
+							photons.push_back(p);
+							max_distance2 = std::max(max_distance2, p.distance2);
+						}
+
+						// 円錐フィルタを使用して放射輝度推定する
+						const double max_distance = sqrt(max_distance2);
+						const double k = 1.1;
+						for (int i = 0; i < photons.size(); i ++) {
+							const double weight = 1.0 - (sqrt(photons[i].distance2) / (k * max_distance)); // 円錐フィルタの重み
+							const Color value = Multiply(obj_.color, photons[i].point->power) / PI; // Diffuse面のBRDF = 1.0 / πであったのでこれをかける
+							accumulated_flux = accumulated_flux + weight * value;
+						}
+						accumulated_flux = accumulated_flux / (1.0 - 2.0 / (3.0 * k)); // 円錐フィルタの係数
+						if (max_distance2 > 0.0) {
+							L[fi * final_gather + fj] = accumulated_flux / (PI * max_distance2) / russian_roulette_probability;
+							accum = accum + L[fi * final_gather + fj] / (final_gather * final_gather);
+						}
 					}
 				}
 			}
+			
+			// 位置勾配を求める
+			Color translation_gradient[3];
+			for (int fi = 0; fi < final_gather; fi ++) {
+				const Vec Ti = u * cos(phi[fi]) + v * sin(phi[fi]);
+				const double phim = 2.0 * PI * fi / final_gather;
+				const Vec Tim = u * cos(phi[fi] + PI/2.0) + v * sin(phi[fi] + PI/2.0);
 
-			R0 = 1.0 / (R0 / final_gather);
+				Color tmp;
+				for (int fj = 1; fj < final_gather; fj ++) {
+					const double theta_jm = asin(sqrt((fj + 1.0) / final_gather));
+					tmp = tmp + sin(theta_jm) * cos(theta_jm) * cos(theta_jm) / std::min(dist[fi * final_gather + fj], dist[fi * final_gather + (fj - 1)])
+									* (L[fi * final_gather + fj] - L[fi * final_gather + (fj - 1)]);
+				}
+				tmp = tmp * 2.0 * PI / final_gather;
+				translation_gradient[0] = translation_gradient[0] + tmp.x * Ti;
+				translation_gradient[1] = translation_gradient[1] + tmp.y * Ti;
+				translation_gradient[2] = translation_gradient[2] + tmp.z * Ti;
+
+
+
+				tmp = Color();
+				for (int fj = 0; fj < final_gather; fj ++) {
+					const double theta_jm = asin(sqrt((double)fj / final_gather));
+					const double theta_jp = asin(sqrt((fj + 1.0) / final_gather));
+					tmp = tmp + (sin(theta_jp) - sin(theta_jm)) / std::min(dist[fi * final_gather + fj], dist[((fi - 1) < 0 ? (final_gather - 1) : (fi - 1)) * final_gather + fj])
+								* (L[fi * final_gather + fj] - L[((fi - 1) < 0 ? (final_gather - 1) : (fi - 1)) * final_gather + fj]);
+				}
+				
+				translation_gradient[0] = translation_gradient[0] + tmp.x * Tim;
+				translation_gradient[1] = translation_gradient[1] + tmp.y * Tim;
+				translation_gradient[2] = translation_gradient[2] + tmp.z * Tim;
+			}
+
+
+			// 回転勾配を求める
+			Color rotational_gradient[3];
+			for (int fi = 0; fi < final_gather; fi ++) {
+				const Vec Ti = u * cos(phi[fi] + PI/2.0) + v * sin(phi[fi] + PI/2.0);
+
+				Color tmp;
+				for (int fj = 0; fj < final_gather; fj ++) {
+					tmp = tmp - tan(theta[fj]) * L[fi * final_gather + fj];
+				}
+				
+				rotational_gradient[0] = rotational_gradient[0] + tmp.x * Ti;
+				rotational_gradient[1] = rotational_gradient[1] + tmp.y * Ti;
+				rotational_gradient[2] = rotational_gradient[2] + tmp.z * Ti;
+			}
+			rotational_gradient[0] = rotational_gradient[0] * PI / (final_gather * final_gather);
+			rotational_gradient[1] = rotational_gradient[1] * PI / (final_gather * final_gather);
+			rotational_gradient[2] = rotational_gradient[2] * PI / (final_gather * final_gather);
+
+			R0 = 1.0 / (R0 / (final_gather * final_gather));
 
 			// イラディアンス追加
-			cache->AddPointToTree(Irradiance(hitpoint, accum * PI, orienting_normal, R0));
+			cache->AddPointToTree(Irradiance(hitpoint, accum * PI, orienting_normal, R0, translation_gradient, rotational_gradient));
 
 			// イラディアンスからray方向への放射輝度推定
 			accum = Multiply(obj.color, accum);
@@ -621,7 +700,15 @@ Color radiance(const Ray &ray, const int depth, PhotonMap *photon_map, Irradianc
 			}
 
 			for (int i = 0; i < irrs.size(); i ++) {
-				accum = accum + irrs[i].weight * irrs[i].point->irradiance / weight / PI; // イラディアンス -> ラディアンスの変換のためにPIでわる（完全拡散面仮定）
+				const Vec xd = hitpoint - irrs[i].point->position;
+				const Vec cd = Cross(irrs[i].point->normal, orienting_normal);
+
+				Color c = Color(Dot(xd, irrs[i].point->translation_gradient[0]), Dot(xd, irrs[i].point->translation_gradient[1]), Dot(xd, irrs[i].point->translation_gradient[2]));
+				Color r = Color(Dot(cd, irrs[i].point->rotational_gradient[0]), Dot(cd, irrs[i].point->rotational_gradient[1]), Dot(cd, irrs[i].point->rotational_gradient[2]));
+
+				accum = accum + irrs[i].weight * 
+					(irrs[i].point->irradiance + r + c)
+					/ weight / PI; // イラディアンス -> ラディアンスの変換のためにPIでわる（完全拡散面仮定）
 			}
 			// イラディアンスからray方向への放射輝度推定
 			accum = Multiply(obj.color, accum);
@@ -731,7 +818,7 @@ int main(int argc, char **argv) {
 	int photon_num = 50000;
 	double gather_photon_radius = 32.0;
 	int gahter_max_photon_num = 64;
-	int final_gather = 64; // final_gather個のサンプル
+	int final_gather = 8; // final_gather x final_gather　個のサンプル
 	int direct_light_samples = 64;
 
 	// カメラ位置
@@ -754,6 +841,7 @@ int main(int argc, char **argv) {
 		pre_build_irradiance_cache(camera, cx, cy, width, height, &photon_map, &cache, gather_photon_radius, gahter_max_photon_num, final_gather, direct_light_samples);
 	}
 
+//#pragma omp parallel for schedule(dynamic, 1) num_threads(10)
 	for (int y = 0; y < height; y ++) {
 		std::cerr << "Rendering " << (100.0 * y / (height - 1)) << "%" << std::endl;
 		srand(y * y * y);
